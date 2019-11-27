@@ -1,0 +1,36 @@
+{
+  "name": "serverless-image-proxy",
+  "version": "1.0.0",
+  "description": "A serverless service for forwarding (POSTing) an matching S3 object to an HTTP API. Images are resized if necessary.",
+  "main": "handler.js",
+  "scripts": {
+    "layer:sharp": "docker run -v \"$PWD\":/var/task -it lambci/lambda:build-nodejs8.10 /bin/bash -c \"cd layer/nodejs && npm install\""
+  },
+  "author": "Andrew Hammond",
+  "license": "none",
+  "dependencies": {
+    "aws-sdk": "^2.353.0",
+    "aws4": "^1.8.0",
+    "axios": "^0.18.1",
+    "sharp": "^0.23.2",
+    "source-map-support": "^0.5.6"
+  },
+  "devDependencies": {
+    "@babel/register": "^7.0.0",
+    "babel-core": "^6.26.3",
+    "babel-eslint": "^8.2.3",
+    "babel-loader": "^7.1.4",
+    "babel-plugin-source-map-support": "^2.0.1",
+    "babel-plugin-transform-object-rest-spread": "^6.26.0",
+    "babel-preset-env": "^1.7.0",
+    "eslint-config-airbnb": "^18.0.1",
+    "serverless": "^1.57.0",
+    "serverless-apigw-binary": "^0.4.4",
+    "serverless-iam-roles-per-function": "^2.0.2",
+    "serverless-webpack": "^5.1.5",
+    "webpack": "^4.8.3",
+    "webpack-node-externals": "^1.7.2"
+  },
+  "eslintIgnore": "node_modules/*",
+  "private": true
+}

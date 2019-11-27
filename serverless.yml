@@ -1,0 +1,220 @@
+service:
+  name: serverless-image-proxy
+  awsKmsKeyArn: ${file(./config.${self:provider.stage}.yaml):aws-kms-key-arn-secrets}
+
+plugins:
+  - serverless-iam-roles-per-function
+  - serverless-webpack
+  # - serverless-apigw-binary # uncomment for testing mock targetapi photo uploads via api gateway
+
+layers:
+  sharp:
+    path: layer
+    compatibleRuntimes:
+      - nodejs8.10
+
+custom:
+  aws_account_id: ${file(./config.${self:provider.stage}.yaml):aws-account-id}
+  webpack:
+    webpackConfig: ./webpack.config.js
+    includeModules:
+      forceExclude:
+        - aws-sdk
+        - sharp
+    packager: npm
+  apigwBinary:
+    types:
+      - 'image/jpeg'
+      - 'image/png'
+  serverless-iam-roles-per-function:
+    defaultInherit: true
+  sqs_queue_name_image_events: ${self:service.name}-image-events-${self:provider.stage}
+  s3_bucket_name_images: ${self:service.name}-images-${self:provider.stage}
+  s3_bucket_arn_images:
+    Fn::Join:
+      - ""
+      - - "arn:aws:s3::"
+        - ":${self:custom.s3_bucket_name_images}"
+
+provider:
+  name: aws
+  runtime: nodejs8.10
+  stage: ${opt:stage, 'dev'}
+  profile: ${opt:profile, 'dev'}
+  region: us-east-1
+  environment:
+    # NOTE: this is useful for local invocations and has no affect in deployed environments
+    AWS_PROFILE: ${self:provider.profile}
+    S3_BUCKET_NAME_IMAGES: ${self:custom.s3_bucket_name_images}
+  iamRoleStatements:
+    - Effect: "Allow"
+      Action:
+        - s3:*
+      Resource:
+        - ${self:custom.s3_bucket_arn_images}
+        - Fn::Join:
+          - ""
+          - - "arn:aws:s3::"
+            - ":${self:custom.s3_bucket_name_images}/*"
+
+package:
+  individually: true
+  exclude:
+    - config.*.yaml
+
+functions:
+  postImage:
+    handler: handlers/post-image.handler
+    description: SQS-triggered function to process S3 events on image uploads, send photo to partner API
+    memorySize: 1024
+    reservedConcurrency: 10
+    environment:
+      LAMBDA_FUNCTION_ARN_RESIZE:
+        Fn::GetAtt: [ ResizeLambdaFunction, Arn]
+      TARGET_AWS_KEY_ENCRYPTED: ${file(./config.${self:provider.stage}.yaml):targetapi-aws-key-encrypted}
+      TARGET_AWS_SECRET_ENCRYPTED: ${file(./config.${self:provider.stage}.yaml):targetapi-aws-secret-encrypted}
+      TARGET_API_HOST: ${file(./config.${self:provider.stage}.yaml):targetapi-api-host}
+      TARGET_API_PATH: ${file(./config.${self:provider.stage}.yaml):targetapi-api-path}
+      TARGET_API_REGION: ${file(./config.${self:provider.stage}.yaml):targetapi-api-region}
+
+      ## This Serverless app's mock_targetapi_image_api endpoint (uncomment all related config)
+      # TARGET_API_HOST:
+      #   Fn::Join:
+      #     - ""
+      #       - Ref: "ApiGatewayRestApi"
+      #       - ".execute-api.${self:provider.region}.amazonaws.com"
+      # TARGET_API_PATH: /${self:provider.stage}
+      # TARGET_API_REGION: ${self:provider.region}
+
+      ## Mock Target API on separate AWS account
+      # TARGET_API_HOST: xxxxxxxx.execute-api.us-east-1.amazonaws.com
+      # TARGET_API_PATH: /stage
+      # TARGET_API_REGION: us-east-1
+    events:
+      - sqs:
+          batchSize: 1
+          enabled: true
+          arn:
+            Fn::GetAtt: [ S3EventsSqsQueue, Arn ]
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - sqs:ReceiveMessage
+          - sqs:DeleteMessage
+          - sqs:GetQueueAttributes
+        Resource:
+          - Fn::GetAtt: [ S3EventsSqsQueue, Arn ]
+      - Effect: "Allow"
+        Action:
+          - lambda:InvokeFunction
+        Resource:
+          - Fn::GetAtt: [ ResizeLambdaFunction, Arn]
+  resize:
+    handler: handlers/resize.handler
+    description: Function to resize an image, in-place, in S3
+    memorySize: 1024
+    reservedConcurrency: 10
+    layers:
+      - { Ref: SharpLambdaLayer }
+
+  # mockTargetApi:
+  #   handler: handlers/mock-target-api/post-image.handler
+  #   events:
+  #     - http:
+  #         path: /image
+  #         method: post
+  #         authorizer: aws_iam
+
+  resources:
+  Resources:
+    S3EventsDLQSqsQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.sqs_queue_name_image_events}-dlq
+    S3EventsSqsQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.sqs_queue_name_image_events}
+        RedrivePolicy:
+          deadLetterTargetArn:
+            Fn::GetAtt: [ S3EventsDLQSqsQueue, Arn ]
+          maxReceiveCount: 20
+    S3BucketServerlessImageProxyEvents:
+      Type: AWS::S3::Bucket
+      DependsOn:
+        - S3BucketServerlessImageProxyEventsSQSQueuePolicy
+      Properties:
+        BucketName: ${self:custom.s3_bucket_name_images}
+        VersioningConfiguration:
+          Status: Enabled
+        NotificationConfiguration:
+          QueueConfigurations:
+            - Event: "s3:ObjectCreated:*"
+              Queue:
+                Fn::GetAtt: [ S3EventsSqsQueue, Arn ]
+              Filter:
+                S3Key:
+                  Rules: # TODO: filter suffix for .png, .jpg, .jpeg (was getting CF errors)
+                    - Name: prefix
+                      Value: "images/"
+    S3BucketServerlessImageProxyEventsSQSQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      DependsOn:
+        - S3EventsSqsQueue
+      Properties:
+        Queues:
+          - Ref: S3EventsSqsQueue
+        PolicyDocument:
+          Version: "2008-10-17"
+          Statement:
+            - Sid: "serverless-image-proxy-publish-to-sqs"
+              Effect: "Allow"
+              Principal:
+                AWS: "*"
+              Action: "sqs:SendMessage"
+              Resource:
+                Fn::GetAtt: [ S3EventsSqsQueue, Arn ]
+              Condition:
+                ArnEquals:
+                  "AWS:SourceArn": ${self:custom.s3_bucket_arn_images}
+    SecretsKMSKey:
+      Type: AWS::KMS::Key
+      Properties:
+        Description: Key for secrets encryption/decryption
+        KeyPolicy:
+          Version: "2012-10-17"
+          Id: ${self:service.name}-secrets
+          Statement:
+            - Sid: Enable IAM User Permissions
+              Effect: Allow
+              Principal:
+                AWS: arn:aws:iam::${self:custom.aws_account_id}:root
+              Action: kms:*
+              Resource: "*"
+            - Sid: Allow administration of the key
+              Effect: Allow
+              Principal:
+                AWS:
+                  # NOTE: usernames must be congruous across envs or must be moved to env-specific config files 
+                  - arn:aws:iam::${self:custom.aws_account_id}:user/ahammond
+              Action:
+                - "kms:*"
+              Resource: "*"
+            - Sid: Allow use of the key
+              Effect: Allow
+              Principal:
+                AWS:
+                  - Fn::GetAtt: [ PostUnderscoreimageIamRoleLambdaExecution, Arn ]
+              Action:
+                - "kms:Encrypt"
+                - "kms:Decrypt"
+                - "kms:ReEncrypt*"
+                - "kms:GenerateDataKey*"
+                - "kms:DescribeKey"
+              Resource: "*"
+    SecretsKMSKeyAlias:
+      Type: AWS::KMS::Alias
+      Properties:
+        AliasName: alias/${self:service.name}-secrets
+        TargetKeyId:
+          Ref: SecretsKMSKey
